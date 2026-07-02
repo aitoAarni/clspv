@@ -276,6 +276,9 @@ Value *MemoryOrderSemantics(Value *order, bool is_global,
       return base_order;
   }
 
+  Value *vulkan_bits = builder.CreateAnd(order, builder.getInt32(0x2000 | 0x4000));
+  order = builder.CreateAnd(order, builder.getInt32(~(0x2000 | 0x4000)));
+
   auto is_relaxed = builder.CreateICmpEQ(order, relaxed);
   auto is_acquire = builder.CreateICmpEQ(order, acquire);
   auto is_release = builder.CreateICmpEQ(order, release);
@@ -287,7 +290,8 @@ Value *MemoryOrderSemantics(Value *order, bool is_global,
   semantics = builder.CreateSelect(is_acq_rel, AcqRelSemantics, semantics);
   if (include_storage)
     semantics = builder.CreateOr({storage, semantics});
-  return builder.CreateSelect(is_relaxed, RelaxedSemantics, semantics);
+  Value *final_semantics = builder.CreateSelect(is_relaxed, RelaxedSemantics, semantics);
+  return builder.CreateOr(final_semantics, vulkan_bits);
 }
 
 Value *MemoryScope(Value *scope, bool is_global, Instruction *InsertBefore) {
