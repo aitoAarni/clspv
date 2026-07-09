@@ -6460,6 +6460,34 @@ void SPIRVProducerPassImpl::GenerateInstruction(Instruction &I) {
 
     RID = addSPIRVInst(spv::OpLoad, Ops);
 
+    // --- VULKAN SYNC LOAD START ---
+    if (MDNode *MD = LD->getMetadata("vk.sync")) {
+      StringRef Tag = cast<MDString>(MD->getOperand(0))->getString();
+      uint64_t Scope = mdconst::extract<ConstantInt>(MD->getOperand(1))->getZExtValue();
+      std::string FullTag = Tag.str() + "_scope_" + std::to_string(Scope);
+
+      // Manually pack the string into 32-bit SPIR-V words
+      SPIRVOperandVec NameOps;
+      NameOps << RID; // We attach the string DIRECTLY to the load's Result ID!
+      
+      const uint32_t length = FullTag.size();
+      const uint32_t wordCount = (length / 4) + 1; 
+      
+      for (uint32_t i = 0; i < wordCount; i++) {
+        uint32_t word = 0;
+        for (uint32_t j = 0; j < 4; j++) {
+          uint32_t ptr = (i * 4) + j;
+          if (ptr < length) {
+            word |= (static_cast<uint32_t>(FullTag[ptr]) << (j * 8));
+          }
+        }
+        NameOps << word;
+      }
+
+      addSPIRVInst<kNames>(spv::OpName, NameOps);
+    }
+    // --- VULKAN SYNC LOAD END ---
+
     auto no_layout_id = getSPIRVType(LD->getType());
     if (no_layout_id.get() != result_type_id.get()) {
       RID = ChangeLayout(RID, LD->getType(), /* removeLayout = */ true);
@@ -6494,6 +6522,47 @@ void SPIRVProducerPassImpl::GenerateInstruction(Instruction &I) {
     //
     // TODO: Do we need to implement Optional Memory Access???
     Ops << ST->getPointerOperand();
+
+    // --- VULKAN SYNC START ---
+    if (MDNode *MD = ST->getMetadata("vk.sync")) {
+      StringRef Tag = cast<MDString>(MD->getOperand(0))->getString();
+      uint64_t Scope = mdconst::extract<ConstantInt>(MD->getOperand(1))->getZExtValue();
+      std::string FullTag = Tag.str() + "_scope_" + std::to_string(Scope);
+
+      SPIRVOperandVec CopyOps;
+      auto type_id = getSPIRVType(value_ty);
+      CopyOps << type_id;
+
+      if (RID.isValid()) {
+        CopyOps << RID;
+      } else {
+        CopyOps << value; 
+      }
+
+      RID = addSPIRVInst(spv::OpCopyObject, CopyOps);
+
+      // pack the string into 32-bit SPIR-V words
+      SPIRVOperandVec NameOps;
+      NameOps << RID;
+      
+      const uint32_t length = FullTag.size();
+      const uint32_t wordCount = (length / 4) + 1;
+      
+      for (uint32_t i = 0; i < wordCount; i++) {
+        uint32_t word = 0;
+        for (uint32_t j = 0; j < 4; j++) {
+          uint32_t ptr = (i * 4) + j;
+          if (ptr < length) {
+            word |= (static_cast<uint32_t>(FullTag[ptr]) << (j * 8));
+          }
+        }
+        NameOps << word;
+      }
+
+      addSPIRVInst<kNames>(spv::OpName, NameOps);
+    }
+    // --- VULKAN SYNC END ---
+
     if (RID.isValid()) {
       Ops << RID;
     } else {

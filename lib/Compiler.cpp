@@ -30,6 +30,7 @@
 #include "llvm/LinkAllPasses.h"
 #include "llvm/Linker/Linker.h"
 #include "llvm/Passes/PassBuilder.h"
+#include "llvm/Plugins/PassPlugin.h"
 #include "llvm/Passes/StandardInstrumentations.h"
 #include "llvm/Support/Allocator.h"
 #include "llvm/Support/CommandLine.h"
@@ -123,6 +124,11 @@ static llvm::cl::list<std::string>
     Defines(llvm::cl::Prefix, "D",
             llvm::cl::desc("Define a #define directive."), llvm::cl::ZeroOrMore,
             llvm::cl::value_desc("define"));
+
+static llvm::cl::list<std::string>
+    PassPlugins("load-pass-plugin",
+                llvm::cl::desc("Load passes from plugin library (.so)"),
+                llvm::cl::value_desc("plugin-filename"), llvm::cl::ZeroOrMore);
 
 static llvm::cl::list<std::string>
     InputsFilename(llvm::cl::Positional, llvm::cl::desc("<input files>"),
@@ -252,7 +258,7 @@ clang::TargetInfo *PrepareTargetInfo(CompilerInstance &instance) {
           enabled) {
         instance.getPreprocessorOpts().addMacroDef(str);
       }
-      if (feat == clspv::FeatureMacro::__opencl_c_int64 && !enabled){
+      if (feat == clspv::FeatureMacro::__opencl_c_int64 && !enabled) {
         instance.getPreprocessorOpts().addMacroUndef(str);
       }
     }
@@ -536,6 +542,17 @@ int RunPassPipeline(llvm::Module &M, llvm::raw_svector_ostream *binaryStream) {
   pb.registerLoopAnalyses(lam);
   pb.crossRegisterProxies(lam, fam, cgam, mam);
 
+for (auto &PluginFN : PassPlugins) {
+    auto Plugin = llvm::PassPlugin::Load(PluginFN);
+    if (!Plugin) {
+      llvm::errs() << "Error: Failed to load LLVM pass plugin from '"
+                   << PluginFN << "': " 
+                   << llvm::toString(Plugin.takeError()) << "\n";
+    } else {
+      Plugin->registerPassBuilderCallbacks(pb);
+    }
+  }
+
   llvm::ModulePassManager pm;
   llvm::FunctionPassManager fpm;
 
@@ -744,7 +761,7 @@ int RunPassPipeline(llvm::Module &M, llvm::raw_svector_ostream *binaryStream) {
     pm.addPass(clspv::SimplifyPointerBitcastPass());
     pm.addPass(clspv::ReplacePointerBitcastPass());
     pm.addPass(llvm::createModuleToFunctionPassAdaptor(llvm::DCEPass()));
-  
+
     pm.addPass(clspv::UndoTranslateSamplerFoldPass());
 
     if (clspv::Option::ModuleConstantsInStorageBuffer()) {
