@@ -6453,22 +6453,17 @@ void SPIRVProducerPassImpl::GenerateInstruction(Instruction &I) {
     SPIRVOperandVec Ops;
     Ops << result_type_id << ptr;
 
-    // Align MemoryOperand helps load vectorization and is required for
-    // PhysicalStorageBuffer
-    Ops << spv::MemoryAccessAlignedMask;
+    uint32_t mem_access = static_cast<uint32_t>(spv::MemoryAccessAlignedMask);
+    Ops << mem_access;
     Ops << static_cast<uint32_t>(LD->getAlign().value());
 
     RID = addSPIRVInst(spv::OpLoad, Ops);
 
-    // --- VULKAN SYNC LOAD START ---
-    if (MDNode *MD = LD->getMetadata("vk.sync")) {
-      StringRef Tag = cast<MDString>(MD->getOperand(0))->getString();
-      uint64_t Scope = mdconst::extract<ConstantInt>(MD->getOperand(1))->getZExtValue();
-      std::string FullTag = Tag.str() + "_scope_" + std::to_string(Scope);
-
-      // Manually pack the string into 32-bit SPIR-V words
+    // Vulkan sync: tag weak loads with OpName
+    if (LD->getMetadata("vk.weak")) {
+      std::string FullTag = "vk_weak_load";
       SPIRVOperandVec NameOps;
-      NameOps << RID; // We attach the string DIRECTLY to the load's Result ID!
+      NameOps << RID;
       
       const uint32_t length = FullTag.size();
       const uint32_t wordCount = (length / 4) + 1; 
@@ -6476,17 +6471,16 @@ void SPIRVProducerPassImpl::GenerateInstruction(Instruction &I) {
       for (uint32_t i = 0; i < wordCount; i++) {
         uint32_t word = 0;
         for (uint32_t j = 0; j < 4; j++) {
-          uint32_t ptr = (i * 4) + j;
-          if (ptr < length) {
-            word |= (static_cast<uint32_t>(FullTag[ptr]) << (j * 8));
+          uint32_t ptr_idx = (i * 4) + j;
+          if (ptr_idx < length) {
+            word |= (static_cast<uint32_t>(FullTag[ptr_idx]) << (j * 8));
           }
         }
         NameOps << word;
       }
-
       addSPIRVInst<kNames>(spv::OpName, NameOps);
     }
-    // --- VULKAN SYNC LOAD END ---
+    // Vulkan sync end
 
     auto no_layout_id = getSPIRVType(LD->getType());
     if (no_layout_id.get() != result_type_id.get()) {
@@ -6523,55 +6517,51 @@ void SPIRVProducerPassImpl::GenerateInstruction(Instruction &I) {
     // TODO: Do we need to implement Optional Memory Access???
     Ops << ST->getPointerOperand();
 
-    // --- VULKAN SYNC START ---
-    if (MDNode *MD = ST->getMetadata("vk.sync")) {
-      StringRef Tag = cast<MDString>(MD->getOperand(0))->getString();
-      uint64_t Scope = mdconst::extract<ConstantInt>(MD->getOperand(1))->getZExtValue();
-      std::string FullTag = Tag.str() + "_scope_" + std::to_string(Scope);
-
+    //  Vulkan sync: tag weak stores via OpCopyObject
+    if (ST->getMetadata("vk.weak")) {
+      std::string FullTag = "vk_weak_store";
+      
+      // Create the copy
       SPIRVOperandVec CopyOps;
-      auto type_id = getSPIRVType(value_ty);
-      CopyOps << type_id;
-
+      CopyOps << getSPIRVType(ST->getValueOperand()->getType());
       if (RID.isValid()) {
         CopyOps << RID;
       } else {
-        CopyOps << value; 
+        CopyOps << ST->getValueOperand();
       }
+        SPIRVID copy_id = addSPIRVInst(spv::OpCopyObject, CopyOps);
 
-      RID = addSPIRVInst(spv::OpCopyObject, CopyOps);
-
-      // pack the string into 32-bit SPIR-V words
+      // Name the copy
       SPIRVOperandVec NameOps;
-      NameOps << RID;
-      
+      NameOps << copy_id;
       const uint32_t length = FullTag.size();
       const uint32_t wordCount = (length / 4) + 1;
-      
       for (uint32_t i = 0; i < wordCount; i++) {
         uint32_t word = 0;
         for (uint32_t j = 0; j < 4; j++) {
-          uint32_t ptr = (i * 4) + j;
-          if (ptr < length) {
-            word |= (static_cast<uint32_t>(FullTag[ptr]) << (j * 8));
+          uint32_t ptr_idx = (i * 4) + j;
+          if (ptr_idx < length) {
+            word |= (static_cast<uint32_t>(FullTag[ptr_idx]) << (j * 8));
           }
         }
         NameOps << word;
       }
-
       addSPIRVInst<kNames>(spv::OpName, NameOps);
-    }
-    // --- VULKAN SYNC END ---
-
-    if (RID.isValid()) {
-      Ops << RID;
+      
+      // Feed the named copy into the Store!
+      Ops << copy_id;
+      // Vulkan sync end
     } else {
-      Ops << ST->getValueOperand();
+      // Standard behavior for normal stores
+      if (RID.isValid()) {
+        Ops << RID;
+      } else {
+        Ops << ST->getValueOperand();
+      }
     }
 
-    // Align MemoryOperand helps store vectorization and is required for
-    // PhysicalStorageBuffer
-    Ops << spv::MemoryAccessAlignedMask;
+    uint32_t mem_access = static_cast<uint32_t>(spv::MemoryAccessAlignedMask);
+    Ops << mem_access;
     Ops << static_cast<uint32_t>(ST->getAlign().value());
 
     RID = addSPIRVInst(spv::OpStore, Ops);
@@ -8199,7 +8189,6 @@ void SPIRVProducerPassImpl::AddArgumentReflection(
     }
     auto type_qual_enum = getSPIRVInt32Constant(type_qual_enum_value);
     Ops << type_qual_enum;
-  
   }
 
   auto arg_info = addSPIRVInst<kReflection>(spv::OpExtInst, Ops);

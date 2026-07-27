@@ -845,7 +845,48 @@ for (auto &PluginFN : PassPlugins) {
     pm.addPass(
         clspv::SPIRVProducerPass(binaryStream, OutputFormat == OutputFormatC));
   });
-
+  
+  // Vulkan sync: metadata injection
+    llvm::MDNode *WeakNode = llvm::MDNode::get(M.getContext(), llvm::MDString::get(M.getContext(), "vk_weak"));
+    
+    for (auto &F : M) {
+      std::vector<llvm::CallInst*> DummiesToRemove;
+      for (auto &BB : F) {
+        for (auto &I : BB) {
+          if (auto *Call = llvm::dyn_cast<llvm::CallInst>(&I)) {
+            if (Call->getCalledFunction() && Call->getCalledFunction()->getName().contains("__vk_weak_memory_access")) {
+              
+              // Look at the users of the Call's return value!
+              std::function<void(llvm::Value*, int)> tagUsers = [&](llvm::Value *V, int depth) {
+                std::string indent(depth * 2, ' ');
+                for (llvm::User *U : V->users()) {
+                  
+                  if (auto *Store = llvm::dyn_cast<llvm::StoreInst>(U)) {
+                    Store->setMetadata("vk.weak", WeakNode);
+                  } else if (auto *Load = llvm::dyn_cast<llvm::LoadInst>(U)) {
+                    Load->setMetadata("vk.weak", WeakNode);
+                  } else if (llvm::isa<llvm::BitCastInst>(U) || 
+                             llvm::isa<llvm::GetElementPtrInst>(U) || 
+                             llvm::isa<llvm::AddrSpaceCastInst>(U)) {
+                    tagUsers(U, depth + 1); 
+                  }
+                }
+              };
+              
+              tagUsers(Call, 1);
+              DummiesToRemove.push_back(Call);
+            }
+          }
+        }
+      }
+      for (auto *Call : DummiesToRemove) {
+        // Wire the original pointer directly to the load/store, bypassing the dummy
+        Call->replaceAllUsesWith(Call->getArgOperand(0));
+        Call->eraseFromParent();
+      }
+    }
+    // Vulkan sync end
+  
   // Add the default optimizations for the requested optimization level.
   if (level.getSpeedupLevel() > 0) {
     auto mpm = pb.buildPerModuleDefaultPipeline(level);
