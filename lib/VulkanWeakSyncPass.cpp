@@ -22,8 +22,8 @@ PreservedAnalyses VulkanWeakSyncPass::run(Function &F,
     if (!I->getMetadata("vk.weak")) {
       MDNode *Node = MDNode::get(Ctx, MDString::get(Ctx, "vk.weak"));
       I->setMetadata("vk.weak", Node);
-      llvm::errs() << "[VK SYNC] Tagged instruction: " << *I
-                   << "\n";
+      llvm::errs() << "[VK SYNC] >>> SUCCESS: Tagged shared memory instance: "
+                   << *I << "\n";
     }
   };
 
@@ -47,27 +47,28 @@ PreservedAnalyses VulkanWeakSyncPass::run(Function &F,
     return false;
   };
 
+  // List of all memory locations that participate in synchronization
+  std::vector<MemoryLocation> WeakLocs;
+
+  // Find the Weak Locations
   for (auto &BB : F) {
     for (auto it = BB.begin(); it != BB.end(); ++it) {
       Instruction *Inst = &*it;
       bool isAcquire = false;
       bool isRelease = false;
 
-      // Identify sync points
+      // Identify Sync Points
       if (auto *Call = dyn_cast<CallInst>(Inst)) {
         Function *CalledFunc = Call->getCalledFunction();
         if (CalledFunc && CalledFunc->isDeclaration()) {
           StringRef Name = CalledFunc->getName();
-
           if (Name.contains("barrier") || Name.contains("fence") ||
               Name.contains("spirv.op.224") || Name.contains("spirv.op.225")) {
             isAcquire = true;
             isRelease = true;
-          }
-          // Catch clspv lowered SPIR-V atomics (227 through 242)
-          else if (Name.contains("spirv.op.22") ||
-                   Name.contains("spirv.op.23") ||
-                   Name.contains("spirv.op.24")) {
+          } else if (Name.contains("spirv.op.22") ||
+                     Name.contains("spirv.op.23") ||
+                     Name.contains("spirv.op.24")) {
             if (Call->arg_size() > 3) {
               if (auto *SemC = dyn_cast<ConstantInt>(Call->getArgOperand(3))) {
                 uint32_t sem = SemC->getZExtValue();
@@ -75,55 +76,31 @@ PreservedAnalyses VulkanWeakSyncPass::run(Function &F,
                   isAcquire = true;
                 if ((sem & 0x4) || (sem & 0x8) || (sem & 0x10))
                   isRelease = true;
-
-                if (isAcquire || isRelease) {
-                  llvm::errs()
-                      << "\n[VK SYNC] FOUND SPIR-V ATOMIC: " << Name << "\n";
-                  llvm::errs() << "[VK SYNC] Semantics: " << sem
-                               << " -> Acquire: " << isAcquire
-                               << ", Release: " << isRelease << "\n";
-                }
               }
             }
           }
         }
       }
 
-      // Handle Release
+      // collect synced memory locations
       if (isRelease) {
-        llvm::errs() << "[VK SYNC] Scanning BACKWARDS for Release...\n";
-        std::vector<MemoryLocation> TaggedLocs;
         SmallVector<BasicBlock *, 8> Worklist;
         SmallPtrSet<BasicBlock *, 8> Visited;
-
         BasicBlock *StartBB = Inst->getParent();
         bool hitSync = false;
 
         for (auto backIt = BasicBlock::reverse_iterator(it);
              backIt != StartBB->rend(); ++backIt) {
           Instruction *Prev = &*backIt;
-
           if (isSyncPoint(Prev)) {
-            llvm::errs()
-                << "[VK SYNC] Hit previous sync point, stopping backward scan: "
-                << *Prev << "\n";
             hitSync = true;
             break;
           }
 
           if (auto *Store = dyn_cast<StoreInst>(Prev)) {
-            llvm::errs() << "[VK SYNC] Found Store: " << *Store << "\n";
-            MemoryLocation Loc = MemoryLocation::get(Store);
-            bool alreadySynced = false;
-            for (auto &TaggedLoc : TaggedLocs) {
-              if (AA.alias(Loc, TaggedLoc) == AliasResult::MustAlias) {
-                alreadySynced = true;
-                break;
-              }
-            }
-            if (!alreadySynced) {
-              TagInst(Store);
-              TaggedLocs.push_back(Loc);
+            unsigned AS = Store->getPointerAddressSpace();
+            if (AS == 1 || AS == 3) { // Only Global/Local
+              WeakLocs.push_back(MemoryLocation::get(Store));
             }
           }
         }
@@ -148,19 +125,9 @@ PreservedAnalyses VulkanWeakSyncPass::run(Function &F,
             }
 
             if (auto *Store = dyn_cast<StoreInst>(Prev)) {
-              llvm::errs() << "[VK SYNC] Found Store in Predecessor: " << *Store
-                           << "\n";
-              MemoryLocation Loc = MemoryLocation::get(Store);
-              bool alreadySynced = false;
-              for (auto &TaggedLoc : TaggedLocs) {
-                if (AA.alias(Loc, TaggedLoc) == AliasResult::MustAlias) {
-                  alreadySynced = true;
-                  break;
-                }
-              }
-              if (!alreadySynced) {
-                TagInst(Store);
-                TaggedLocs.push_back(Loc);
+              unsigned AS = Store->getPointerAddressSpace();
+              if (AS == 1 || AS == 3) {
+                WeakLocs.push_back(MemoryLocation::get(Store));
               }
             }
           }
@@ -171,9 +138,8 @@ PreservedAnalyses VulkanWeakSyncPass::run(Function &F,
         }
       }
 
-      // Handle Acquire 
+      // Collect synced memory locations
       if (isAcquire) {
-        std::vector<MemoryLocation> TaggedLocs;
         SmallVector<BasicBlock *, 8> Worklist;
         SmallPtrSet<BasicBlock *, 8> Visited;
         BasicBlock *StartBB = Inst->getParent();
@@ -186,29 +152,25 @@ PreservedAnalyses VulkanWeakSyncPass::run(Function &F,
             hitSync = true;
             break;
           }
+
           if (auto *Load = dyn_cast<LoadInst>(Next)) {
-            MemoryLocation Loc = MemoryLocation::get(Load);
-            bool alreadySynced = false;
-            for (auto &TaggedLoc : TaggedLocs) {
-              if (AA.alias(Loc, TaggedLoc) == AliasResult::MustAlias) {
-                alreadySynced = true;
-                break;
-              }
-            }
-            if (!alreadySynced) {
-              TagInst(Load);
-              TaggedLocs.push_back(Loc);
+            unsigned AS = Load->getPointerAddressSpace();
+            if (AS == 1 || AS == 3) {
+              WeakLocs.push_back(MemoryLocation::get(Load));
             }
           }
         }
+
         if (!hitSync) {
           for (BasicBlock *Succ : successors(StartBB))
             Worklist.push_back(Succ);
         }
+
         while (!Worklist.empty()) {
           BasicBlock *CurrBB = Worklist.pop_back_val();
           if (!Visited.insert(CurrBB).second)
             continue;
+
           hitSync = false;
           for (auto fwdIt = CurrBB->begin(); fwdIt != CurrBB->end(); ++fwdIt) {
             Instruction *Next = &*fwdIt;
@@ -216,24 +178,50 @@ PreservedAnalyses VulkanWeakSyncPass::run(Function &F,
               hitSync = true;
               break;
             }
+
             if (auto *Load = dyn_cast<LoadInst>(Next)) {
-              MemoryLocation Loc = MemoryLocation::get(Load);
-              bool alreadySynced = false;
-              for (auto &TaggedLoc : TaggedLocs) {
-                if (AA.alias(Loc, TaggedLoc) == AliasResult::MustAlias) {
-                  alreadySynced = true;
-                  break;
-                }
-              }
-              if (!alreadySynced) {
-                TagInst(Load);
-                TaggedLocs.push_back(Loc);
+              unsigned AS = Load->getPointerAddressSpace();
+              if (AS == 1 || AS == 3) {
+                WeakLocs.push_back(MemoryLocation::get(Load));
               }
             }
           }
           if (!hitSync) {
             for (BasicBlock *Succ : successors(CurrBB))
               Worklist.push_back(Succ);
+          }
+        }
+      }
+    }
+  }
+
+  // Tag all global instances
+  if (!WeakLocs.empty()) {
+    for (auto &BB : F) {
+      for (auto &I : BB) {
+        if (auto *Store = dyn_cast<StoreInst>(&I)) {
+          unsigned AS = Store->getPointerAddressSpace();
+          if (AS == 1 || AS == 3) {
+            MemoryLocation Loc = MemoryLocation::get(Store);
+            for (auto &WeakLoc : WeakLocs) {
+              // If this store points to any of our known synced variables, tag it
+              if (AA.alias(Loc, WeakLoc) == AliasResult::MustAlias) {
+                TagInst(Store);
+                break;
+              }
+            }
+          }
+        } else if (auto *Load = dyn_cast<LoadInst>(&I)) {
+          unsigned AS = Load->getPointerAddressSpace();
+          if (AS == 1 || AS == 3) {
+            MemoryLocation Loc = MemoryLocation::get(Load);
+            for (auto &WeakLoc : WeakLocs) {
+              // If this load points to any of our known synced variables, tag it
+              if (AA.alias(Loc, WeakLoc) == AliasResult::MustAlias) {
+                TagInst(Load);
+                break;
+              }
+            }
           }
         }
       }
