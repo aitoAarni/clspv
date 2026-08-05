@@ -6460,8 +6460,12 @@ void SPIRVProducerPassImpl::GenerateInstruction(Instruction &I) {
     RID = addSPIRVInst(spv::OpLoad, Ops);
 
     // Vulkan sync: tag weak loads with OpName
-    if (LD->getMetadata("vk.weak")) {
-      std::string FullTag = "vk_weak_load";
+    if (MDNode *MD = LD->getMetadata("vk.weak")) {
+      std::string FullTag = "vk_weak"; 
+      if (auto *MDS = dyn_cast<MDString>(MD->getOperand(0))) {
+        FullTag = MDS->getString().str(); // extracts "vk_weak_closest_1"
+      }
+
       SPIRVOperandVec NameOps;
       NameOps << RID;
       
@@ -6517,9 +6521,12 @@ void SPIRVProducerPassImpl::GenerateInstruction(Instruction &I) {
     // TODO: Do we need to implement Optional Memory Access???
     Ops << ST->getPointerOperand();
 
-    //  Vulkan sync: tag weak stores via OpCopyObject
-    if (ST->getMetadata("vk.weak")) {
-      std::string FullTag = "vk_weak_store";
+//  Vulkan sync: tag weak stores via OpCopyObject
+    if (MDNode *MD = ST->getMetadata("vk.weak")) {
+      std::string FullTag = "vk_weak"; 
+      if (auto *MDS = dyn_cast<MDString>(MD->getOperand(0))) {
+        FullTag = MDS->getString().str(); // extracts "vk_weak_closest_1"
+      }
       
       // Create the copy
       SPIRVOperandVec CopyOps;
@@ -6529,7 +6536,7 @@ void SPIRVProducerPassImpl::GenerateInstruction(Instruction &I) {
       } else {
         CopyOps << ST->getValueOperand();
       }
-        SPIRVID copy_id = addSPIRVInst(spv::OpCopyObject, CopyOps);
+      SPIRVID copy_id = addSPIRVInst(spv::OpCopyObject, CopyOps);
 
       // Name the copy
       SPIRVOperandVec NameOps;
@@ -6548,7 +6555,6 @@ void SPIRVProducerPassImpl::GenerateInstruction(Instruction &I) {
       }
       addSPIRVInst<kNames>(spv::OpName, NameOps);
       
-      // Feed the named copy into the Store!
       Ops << copy_id;
       // Vulkan sync end
     } else {
